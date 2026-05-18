@@ -43,6 +43,7 @@ else:
 WATCH_MAP = False
 WATCH_DB = False
 current_observer = None
+_db_client = None
 
 COLLECTION_NAME = "codebase"
 
@@ -268,11 +269,13 @@ def generate_map():
 # --- VECTOR DB LOGIC ---
 
 def get_db_collection():
+    global _db_client
     if not chromadb:
         raise ImportError("chromadb is not installed. Run: pip install -r requirements.txt")
-    db_dir = os.path.join(ROOT_DIR, ".ag_chromadb")
-    client = chromadb.PersistentClient(path=db_dir)
-    collection = client.get_or_create_collection(name=COLLECTION_NAME)
+    if _db_client is None:
+        db_dir = os.path.join(ROOT_DIR, ".ag_chromadb")
+        _db_client = chromadb.PersistentClient(path=db_dir)
+    collection = _db_client.get_or_create_collection(name=COLLECTION_NAME)
     return collection
 
 def chunk_file(file_path: str, chunk_size=1000, overlap=200):
@@ -321,16 +324,20 @@ def chunk_file(file_path: str, chunk_size=1000, overlap=200):
     return chunks
 
 def index_project(progress_callback=None):
+    global _db_client
     print("[CodeCompass] Building Vector Database. This may take a while on first run...")
     if not chromadb:
         raise ImportError("chromadb is not installed. Run: pip install -r requirements.txt")
-    db_dir = os.path.join(ROOT_DIR, ".ag_chromadb")
-    client = chromadb.PersistentClient(path=db_dir)
+        
+    if _db_client is None:
+        db_dir = os.path.join(ROOT_DIR, ".ag_chromadb")
+        _db_client = chromadb.PersistentClient(path=db_dir)
+        
     try:
-        client.delete_collection(COLLECTION_NAME)
+        _db_client.delete_collection(COLLECTION_NAME)
     except Exception:
         pass
-    collection = client.get_or_create_collection(name=COLLECTION_NAME)
+    collection = _db_client.get_or_create_collection(name=COLLECTION_NAME)
 
     all_files = walk_dir(ROOT_DIR)
     total_files = len(all_files)
@@ -524,10 +531,11 @@ def run_gui():
     lbl_dir.pack(side='left', fill='x', expand=True)
     
     def on_change_dir():
-        global ROOT_DIR
+        global ROOT_DIR, _db_client
         new_dir = filedialog.askdirectory(initialdir=ROOT_DIR, title="Select Project Directory")
         if new_dir:
             ROOT_DIR = new_dir
+            _db_client = None # Reset DB client for the new directory
             lbl_dir.config(text=f"Target Directory: {ROOT_DIR}")
             restart_observer()
             
