@@ -17,6 +17,22 @@ except ImportError:
     Observer = None
     FileSystemEventHandler = object
 
+try:
+    import tree_sitter
+    import tree_sitter_python
+    import tree_sitter_javascript
+    import tree_sitter_typescript
+    
+    TS_LANGS = {
+        'python': tree_sitter.Language(tree_sitter_python.language()),
+        'javascript': tree_sitter.Language(tree_sitter_javascript.language()),
+        'typescript': tree_sitter.Language(tree_sitter_typescript.language_typescript()),
+        'tsx': tree_sitter.Language(tree_sitter_typescript.language_tsx()),
+    }
+except ImportError:
+    tree_sitter = None
+    TS_LANGS = {}
+
 # Constants
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if os.path.basename(SCRIPT_DIR) == "codecompass":
@@ -85,53 +101,112 @@ def parse_file(file_path: str) -> Optional[Dict[str, List[str]]]:
 
     ext = os.path.splitext(file_path)[1].lower()
     types, funcs, hooks = [], [], []
-
-    if ext in {'.js', '.jsx', '.ts', '.tsx'}:
-        interface_regex = re.compile(r'export\s+interface\s+([A-Za-z0-9_]+)')
-        type_regex = re.compile(r'export\s+type\s+([A-Za-z0-9_]+)')
-        func_regex = re.compile(r'export\s+(?:default\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z0-9_]+)')
-        arrow_func_regex = re.compile(r'export\s+(?:const|let)\s+([A-Za-z0-9_]+)\s*=')
-
-        types.extend([f"interface {m}" for m in interface_regex.findall(content)])
-        types.extend([f"type {m}" for m in type_regex.findall(content)])
+    
+    # 1. Attempt Tree-Sitter AST Parsing
+    parsed_with_ts = False
+    if tree_sitter is not None:
+        lang_key = None
+        if ext == '.py': lang_key = 'python'
+        elif ext in {'.js', '.jsx'}: lang_key = 'javascript'
+        elif ext == '.ts': lang_key = 'typescript'
+        elif ext == '.tsx': lang_key = 'tsx'
         
-        for name in func_regex.findall(content) + arrow_func_regex.findall(content):
-            if name.startswith('use'):
-                hooks.append(name)
-            else:
-                funcs.append(name)
-
-    elif ext == '.py':
-        class_regex = re.compile(r'^class\s+([A-Za-z0-9_]+)', re.MULTILINE)
-        func_regex = re.compile(r'^def\s+([A-Za-z0-9_]+)', re.MULTILINE)
-        types.extend([f"class {m}" for m in class_regex.findall(content)])
-        funcs.extend([f"def {m}" for m in func_regex.findall(content)])
-
-    elif ext in {'.cs', '.java', '.kt', '.php'}:
-        class_regex = re.compile(r'(?:public|private|protected|internal)?\s*(?:static\s+)?(?:sealed\s+)?(?:abstract\s+)?(?:class|interface|record|enum|struct|trait)\s+([A-Za-z0-9_]+)')
-        types.extend(class_regex.findall(content))
-
-    elif ext == '.go':
-        type_regex = re.compile(r'^type\s+([A-Za-z0-9_]+)', re.MULTILINE)
-        func_regex = re.compile(r'^func\s+(?:\([^)]+\)\s+)?([A-Za-z0-9_]+)', re.MULTILINE)
-        types.extend([f"type {m}" for m in type_regex.findall(content)])
-        funcs.extend([f"func {m}" for m in func_regex.findall(content)])
-
-    elif ext == '.rs':
-        struct_regex = re.compile(r'^(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z0-9_]+)', re.MULTILINE)
-        func_regex = re.compile(r'^(?:pub\s+)?fn\s+([A-Za-z0-9_]+)', re.MULTILINE)
-        types.extend(struct_regex.findall(content))
-        funcs.extend([f"fn {m}" for m in func_regex.findall(content)])
-
-    elif ext in {'.c', '.cpp', '.h', '.hpp'}:
-        struct_regex = re.compile(r'^(?:struct|class)\s+([A-Za-z0-9_]+)', re.MULTILINE)
-        types.extend(struct_regex.findall(content))
-
-    elif ext == '.rb':
-        class_regex = re.compile(r'^class\s+([A-Za-z0-9_]+)', re.MULTILINE)
-        func_regex = re.compile(r'^def\s+([A-Za-z0-9_!]+)', re.MULTILINE)
-        types.extend([f"class {m}" for m in class_regex.findall(content)])
-        funcs.extend([f"def {m}" for m in func_regex.findall(content)])
+        if lang_key and lang_key in TS_LANGS:
+            try:
+                lang = TS_LANGS[lang_key]
+                parser = tree_sitter.Parser(lang)
+                tree = parser.parse(content.encode('utf-8'))
+                
+                if lang_key == 'python':
+                    query = tree_sitter.Query(lang, """
+                    (function_definition name: (identifier) @func_name)
+                    (class_definition name: (identifier) @class_name)
+                    """)
+                else: # JS/TS
+                    query = tree_sitter.Query(lang, """
+                    (export_statement declaration: (function_declaration name: (identifier) @func_name))
+                    (export_statement value: (function_declaration name: (identifier) @func_name))
+                    (export_statement declaration: (class_declaration name: (identifier) @class_name))
+                    (export_statement value: (class_declaration name: (identifier) @class_name))
+                    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @var_name value: (arrow_function))))
+                    (export_statement declaration: (type_alias_declaration name: (type_identifier) @type_name))
+                    (export_statement declaration: (interface_declaration name: (type_identifier) @interface_name))
+                    """)
+                    
+                cursor = tree_sitter.QueryCursor(query)
+                for _, captures in cursor.matches(tree.root_node):
+                    if 'func_name' in captures:
+                        for n in captures['func_name']:
+                            name = n.text.decode('utf8')
+                            if lang_key == 'python': funcs.append(f"def {name}")
+                            else: (hooks if name.startswith('use') else funcs).append(name)
+                    if 'var_name' in captures:
+                        for n in captures['var_name']:
+                            name = n.text.decode('utf8')
+                            (hooks if name.startswith('use') else funcs).append(name)
+                    if 'class_name' in captures:
+                        for n in captures['class_name']:
+                            name = n.text.decode('utf8')
+                            types.append(f"class {name}")
+                    if 'type_name' in captures:
+                        for n in captures['type_name']:
+                            types.append(f"type {n.text.decode('utf8')}")
+                    if 'interface_name' in captures:
+                        for n in captures['interface_name']:
+                            types.append(f"interface {n.text.decode('utf8')}")
+                
+                parsed_with_ts = True
+            except Exception:
+                pass # Fall back to regex if tree-sitter fails
+                
+    # 2. Regex Fallback
+    if not parsed_with_ts:
+        if ext in {'.js', '.jsx', '.ts', '.tsx'}:
+            interface_regex = re.compile(r'export\s+interface\s+([A-Za-z0-9_]+)')
+            type_regex = re.compile(r'export\s+type\s+([A-Za-z0-9_]+)')
+            func_regex = re.compile(r'export\s+(?:default\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z0-9_]+)')
+            arrow_func_regex = re.compile(r'export\s+(?:const|let)\s+([A-Za-z0-9_]+)\s*=')
+    
+            types.extend([f"interface {m}" for m in interface_regex.findall(content)])
+            types.extend([f"type {m}" for m in type_regex.findall(content)])
+            
+            for name in func_regex.findall(content) + arrow_func_regex.findall(content):
+                if name.startswith('use'):
+                    hooks.append(name)
+                else:
+                    funcs.append(name)
+    
+        elif ext == '.py':
+            class_regex = re.compile(r'^class\s+([A-Za-z0-9_]+)', re.MULTILINE)
+            func_regex = re.compile(r'^def\s+([A-Za-z0-9_]+)', re.MULTILINE)
+            types.extend([f"class {m}" for m in class_regex.findall(content)])
+            funcs.extend([f"def {m}" for m in func_regex.findall(content)])
+    
+        elif ext in {'.cs', '.java', '.kt', '.php'}:
+            class_regex = re.compile(r'(?:public|private|protected|internal)?\s*(?:static\s+)?(?:sealed\s+)?(?:abstract\s+)?(?:class|interface|record|enum|struct|trait)\s+([A-Za-z0-9_]+)')
+            types.extend(class_regex.findall(content))
+    
+        elif ext == '.go':
+            type_regex = re.compile(r'^type\s+([A-Za-z0-9_]+)', re.MULTILINE)
+            func_regex = re.compile(r'^func\s+(?:\([^)]+\)\s+)?([A-Za-z0-9_]+)', re.MULTILINE)
+            types.extend([f"type {m}" for m in type_regex.findall(content)])
+            funcs.extend([f"func {m}" for m in func_regex.findall(content)])
+    
+        elif ext == '.rs':
+            struct_regex = re.compile(r'^(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z0-9_]+)', re.MULTILINE)
+            func_regex = re.compile(r'^(?:pub\s+)?fn\s+([A-Za-z0-9_]+)', re.MULTILINE)
+            types.extend(struct_regex.findall(content))
+            funcs.extend([f"fn {m}" for m in func_regex.findall(content)])
+    
+        elif ext in {'.c', '.cpp', '.h', '.hpp'}:
+            struct_regex = re.compile(r'^(?:struct|class)\s+([A-Za-z0-9_]+)', re.MULTILINE)
+            types.extend(struct_regex.findall(content))
+    
+        elif ext == '.rb':
+            class_regex = re.compile(r'^class\s+([A-Za-z0-9_]+)', re.MULTILINE)
+            func_regex = re.compile(r'^def\s+([A-Za-z0-9_!]+)', re.MULTILINE)
+            types.extend([f"class {m}" for m in class_regex.findall(content)])
+            funcs.extend([f"def {m}" for m in func_regex.findall(content)])
 
     if not types and not funcs and not hooks:
         return None

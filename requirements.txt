@@ -1,2 +1,7 @@
 chromadb>=0.4.20
 watchdog>=4.0.0
+
+tree-sitter
+tree-sitter-python
+tree-sitter-javascript
+tree-sitter-typescript
