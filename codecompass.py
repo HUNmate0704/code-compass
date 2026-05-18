@@ -33,16 +33,17 @@ except ImportError:
     tree_sitter = None
     TS_LANGS = {}
 
-# Constants
+# Global State
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if os.path.basename(SCRIPT_DIR) == "codecompass":
     ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 else:
     ROOT_DIR = os.getcwd()
 
-AI_MAP_FILE = os.path.join(ROOT_DIR, "AI_MAP.md")
-CURSOR_RULES_FILE = os.path.join(ROOT_DIR, ".cursorrules")
-DB_DIR = os.path.join(ROOT_DIR, ".ag_chromadb")
+WATCH_MAP = False
+WATCH_DB = False
+current_observer = None
+
 COLLECTION_NAME = "codebase"
 
 IGNORED_DIRS = {
@@ -61,6 +62,7 @@ ALLOWED_EXTS = {
 # --- PARSER LOGIC ---
 
 def generate_cursor_rules():
+    cursor_rules_file = os.path.join(ROOT_DIR, ".cursorrules")
     new_rules = """
 ## AI Context Builder (Auto-Generated)
 Before starting any complex task, **you MUST read the `AI_MAP.md` file** in the root directory. It contains the structural skeleton of the project.
@@ -77,17 +79,17 @@ Read the terminal output to get exact file paths and line numbers.
 If you create a new file or change the structure, remind the user to run the indexer or ensure the watcher is running.
 """
     
-    if os.path.exists(CURSOR_RULES_FILE):
-        with open(CURSOR_RULES_FILE, 'r', encoding='utf-8') as f:
+    if os.path.exists(cursor_rules_file):
+        with open(cursor_rules_file, 'r', encoding='utf-8') as f:
             existing = f.read()
         if "Deep Semantic Search (Vector DB)" in existing:
             return # Már benne van, nem piszkáljuk az egyedi szabályokat
             
-        with open(CURSOR_RULES_FILE, 'a', encoding='utf-8') as f:
+        with open(cursor_rules_file, 'a', encoding='utf-8') as f:
             f.write("\n" + new_rules)
         print("[CodeCompass] Appended AI tools to existing .cursorrules file.")
     else:
-        with open(CURSOR_RULES_FILE, 'w', encoding='utf-8') as f:
+        with open(cursor_rules_file, 'w', encoding='utf-8') as f:
             f.write("# AI Assistant Instructions\n" + new_rules)
         print("[CodeCompass] Created new .cursorrules file.")
 
@@ -259,7 +261,7 @@ def generate_map():
             markdown += f"- **Exports/Functions**: {', '.join(data['funcs'])}\n"
         markdown += "\n"
 
-    with open(AI_MAP_FILE, 'w', encoding='utf-8') as f:
+    with open(os.path.join(ROOT_DIR, "AI_MAP.md"), 'w', encoding='utf-8') as f:
         f.write(markdown)
     print(f"[CodeCompass] Regenerated AI_MAP.md (Processed {processed} files)")
 
@@ -268,7 +270,8 @@ def generate_map():
 def get_db_collection():
     if not chromadb:
         raise ImportError("chromadb is not installed. Run: pip install -r requirements.txt")
-    client = chromadb.PersistentClient(path=DB_DIR)
+    db_dir = os.path.join(ROOT_DIR, ".ag_chromadb")
+    client = chromadb.PersistentClient(path=db_dir)
     collection = client.get_or_create_collection(name=COLLECTION_NAME)
     return collection
 
@@ -317,11 +320,12 @@ def chunk_file(file_path: str, chunk_size=1000, overlap=200):
         
     return chunks
 
-def index_project():
+def index_project(progress_callback=None):
     print("[CodeCompass] Building Vector Database. This may take a while on first run...")
     if not chromadb:
         raise ImportError("chromadb is not installed. Run: pip install -r requirements.txt")
-    client = chromadb.PersistentClient(path=DB_DIR)
+    db_dir = os.path.join(ROOT_DIR, ".ag_chromadb")
+    client = chromadb.PersistentClient(path=db_dir)
     try:
         client.delete_collection(COLLECTION_NAME)
     except Exception:
@@ -329,13 +333,17 @@ def index_project():
     collection = client.get_or_create_collection(name=COLLECTION_NAME)
 
     all_files = walk_dir(ROOT_DIR)
+    total_files = len(all_files)
     
     docs = []
     metadatas = []
     ids = []
     
     count = 0
-    for file_path in all_files:
+    for i, file_path in enumerate(all_files):
+        if progress_callback:
+            progress_callback(i + 1, total_files, file_path)
+            
         chunks = chunk_file(file_path)
         for j, chunk in enumerate(chunks):
             docs.append(chunk['text'])
@@ -352,6 +360,32 @@ def index_project():
         collection.add(documents=docs, metadatas=metadatas, ids=ids)
         
     print(f"[CodeCompass] Indexed {count} code chunks into Vector DB.")
+
+def update_file_in_db(file_path: str):
+    if not chromadb:
+        return
+    try:
+        col = get_db_collection()
+        # Delete existing chunks for this file
+        col.delete(where={"file": file_path})
+        
+        # If file still exists (not just a deletion event), re-chunk and insert
+        if os.path.exists(file_path):
+            chunks = chunk_file(file_path)
+            if not chunks: return
+            
+            docs, metadatas, ids = [], [], []
+            for j, chunk in enumerate(chunks):
+                docs.append(chunk['text'])
+                metadatas.append(chunk['metadata'])
+                ids.append(f"{file_path}_{j}")
+                
+            col.add(documents=docs, metadatas=metadatas, ids=ids)
+            print(f"[CodeCompass] Incremental DB Update: {os.path.basename(file_path)} ({len(chunks)} chunks)")
+        else:
+            print(f"[CodeCompass] Incremental DB Delete: {os.path.basename(file_path)}")
+    except Exception as e:
+        print(f"[CodeCompass] Error updating DB for {os.path.basename(file_path)}: {e}")
 
 def search_db(query: str, n_results=3):
     try:
@@ -404,17 +438,36 @@ class CodeChangeHandler(FileSystemEventHandler if FileSystemEventHandler is not 
             if part in IGNORED_DIRS: return False
         return True
 
-    def on_modified(self, event):
+    def handle_event(self, event):
         if event.is_directory: return
-        if not self.should_process(event.src_path): return
+        path = event.src_path
+        if not self.should_process(path): return
         
         now = time.time()
-        if now - self.last_map_update > 2:
-            print(f"[CodeCompass] Detected change in {os.path.basename(event.src_path)}. Updating map...")
-            generate_map()
+        import threading
+        
+        if WATCH_MAP and (now - self.last_map_update > 2):
+            print(f"[CodeCompass] Detected change in {os.path.basename(path)}. Updating map...")
+            threading.Thread(target=generate_map, daemon=True).start()
             self.last_map_update = now
+            
+        if WATCH_DB:
+            # Trigger incremental DB update in background
+            threading.Thread(target=update_file_in_db, args=(path,), daemon=True).start()
+
+    def on_modified(self, event):
+        self.handle_event(event)
+        
+    def on_created(self, event):
+        self.handle_event(event)
+        
+    def on_deleted(self, event):
+        self.handle_event(event)
 
 def start_watcher():
+    global WATCH_MAP, WATCH_DB
+    WATCH_MAP = True
+    WATCH_DB = True
     if not Observer:
         print("watchdog is not installed. Run: pip install -r requirements.txt")
         return
@@ -429,23 +482,60 @@ def start_watcher():
         observer.stop()
     observer.join()
 
+def restart_observer():
+    global current_observer
+    if not Observer: return
+    
+    if current_observer:
+        try:
+            current_observer.stop()
+            current_observer.join(timeout=1)
+        except Exception:
+            pass
+        current_observer = None
+        
+    if WATCH_MAP or WATCH_DB:
+        current_observer = Observer()
+        current_observer.schedule(CodeChangeHandler(), ROOT_DIR, recursive=True)
+        current_observer.start()
+
 # --- GUI LOGIC ---
 
 def run_gui():
     import tkinter as tk
-    from tkinter import ttk, messagebox, scrolledtext
+    from tkinter import ttk, messagebox, scrolledtext, filedialog
     import threading
+    
+    global ROOT_DIR
     
     root = tk.Tk()
     root.title("CodeCompass Builder")
-    root.geometry("650x500")
+    root.geometry("650x550")
     
     style = ttk.Style()
     if 'clam' in style.theme_names():
         style.theme_use('clam')
+        
+    # --- Top Frame (Directory Selection) ---
+    top_frame = ttk.Frame(root)
+    top_frame.pack(fill='x', padx=10, pady=10)
     
+    lbl_dir = ttk.Label(top_frame, text=f"Target Directory: {ROOT_DIR}", font=("Helvetica", 10, "italic"))
+    lbl_dir.pack(side='left', fill='x', expand=True)
+    
+    def on_change_dir():
+        global ROOT_DIR
+        new_dir = filedialog.askdirectory(initialdir=ROOT_DIR, title="Select Project Directory")
+        if new_dir:
+            ROOT_DIR = new_dir
+            lbl_dir.config(text=f"Target Directory: {ROOT_DIR}")
+            restart_observer()
+            
+    btn_change_dir = ttk.Button(top_frame, text="Change Directory", command=on_change_dir)
+    btn_change_dir.pack(side='right', padx=5)
+
     notebook = ttk.Notebook(root)
-    notebook.pack(fill='both', expand=True, padx=10, pady=10)
+    notebook.pack(fill='both', expand=True, padx=10, pady=5)
     
     tab_map = ttk.Frame(notebook)
     tab_db = ttk.Frame(notebook)
@@ -469,49 +559,51 @@ def run_gui():
     ttk.Label(tab_map, text="Universal AI Map Generator", font=("Helvetica", 14, "bold")).pack(pady=(20,5))
     ttk.Label(tab_map, text="Scans the root directory and builds AI_MAP.md").pack(pady=5)
 
-    btn_map = ttk.Button(tab_map, text="1. Generate AI Code Map", command=on_generate_map)
+    btn_map = ttk.Button(tab_map, text="Generate AI Code Map", command=on_generate_map)
     btn_map.pack(pady=10, ipadx=10, ipady=5)
     
-    ttk.Separator(tab_map, orient='horizontal').pack(fill='x', pady=20, padx=20)
-    
-    watcher_thread = None
-    def toggle_watcher():
-        nonlocal watcher_thread
-        if watcher_thread is None or not watcher_thread.is_alive():
-            watcher_thread = threading.Thread(target=start_watcher_gui, daemon=True)
-            watcher_thread.start()
-            btn_watch.config(text="Stop Watcher (Requires Restart)")
-            lbl_status.config(text="Watcher: RUNNING", foreground="green")
+    map_var = tk.BooleanVar(value=False)
+    def toggle_map_watcher():
+        global WATCH_MAP
+        WATCH_MAP = map_var.get()
+        restart_observer()
+        if WATCH_MAP:
+            lbl_map_status.config(text="Map Auto-Update: ON", foreground="green")
         else:
-            messagebox.showinfo("Watcher", "Watcher is running in background.")
+            lbl_map_status.config(text="Map Auto-Update: OFF", foreground="gray")
             
-    def start_watcher_gui():
-        if not Observer:
-            root.after(0, lambda: messagebox.showerror("Error", "watchdog is not installed."))
-            return
-        observer = Observer()
-        observer.schedule(CodeChangeHandler(), ROOT_DIR, recursive=True)
-        observer.start()
-        observer.join()
-        
-    btn_watch = ttk.Button(tab_map, text="2. Start File Watcher", command=toggle_watcher)
-    btn_watch.pack(pady=10, ipadx=10, ipady=5)
+    chk_map = ttk.Checkbutton(tab_map, text="Auto-update AI_MAP.md on file save", variable=map_var, command=toggle_map_watcher)
+    chk_map.pack(pady=5)
     
-    lbl_status = ttk.Label(tab_map, text="Watcher: STOPPED", foreground="red")
-    lbl_status.pack(pady=5)
+    lbl_map_status = ttk.Label(tab_map, text="Map Auto-Update: OFF", foreground="gray")
+    lbl_map_status.pack(pady=2)
     
     # --- Vector DB Tab ---
     ttk.Label(tab_db, text="ChromaDB Vector Database", font=("Helvetica", 14, "bold")).pack(pady=(10,5))
     
+    lbl_current_file = ttk.Label(tab_db, text="")
+    lbl_current_file.pack(pady=(5, 0))
+    
+    progress = ttk.Progressbar(tab_db, orient="horizontal", length=300, mode="determinate")
+    progress.pack(pady=5)
+    
     def on_index_db():
         btn_index.config(state="disabled")
-        lbl_db_status.config(text="Indexing... Please wait. (Model will download if first time)")
+        lbl_db_status.config(text="Indexing... Please wait. (Model will download if first time)", foreground="black")
+        progress["value"] = 0
         root.update()
         
+        def progress_cb(current, total, file_path):
+            filename = os.path.basename(file_path)
+            # Use root.after to safely update GUI from background thread
+            root.after(0, lambda: lbl_current_file.config(text=f"({current}/{total}) Indexing: {filename}"))
+            root.after(0, lambda: progress.config(value=(current / total) * 100))
+            
         def run_index():
             try:
-                index_project()
+                index_project(progress_callback=progress_cb)
                 root.after(0, lambda: lbl_db_status.config(text="Indexing complete!", foreground="green"))
+                root.after(0, lambda: lbl_current_file.config(text="Done."))
             except Exception as e:
                 err = str(e)
                 root.after(0, lambda: lbl_db_status.config(text=f"Error: {err}", foreground="red"))
@@ -520,11 +612,27 @@ def run_gui():
                 
         threading.Thread(target=run_index, daemon=True).start()
         
-    btn_index = ttk.Button(tab_db, text="1. Build/Rebuild Vector DB", command=on_index_db)
+    btn_index = ttk.Button(tab_db, text="Build/Rebuild Vector DB", command=on_index_db)
     btn_index.pack(pady=5, ipadx=10, ipady=5)
     
+    db_var = tk.BooleanVar(value=False)
+    def toggle_db_watcher():
+        global WATCH_DB
+        WATCH_DB = db_var.get()
+        restart_observer()
+        if WATCH_DB:
+            lbl_db_watch_status.config(text="DB Auto-Update: ON", foreground="green")
+        else:
+            lbl_db_watch_status.config(text="DB Auto-Update: OFF", foreground="gray")
+            
+    chk_db = ttk.Checkbutton(tab_db, text="Auto-update DB on file save (Incremental)", variable=db_var, command=toggle_db_watcher)
+    chk_db.pack(pady=5)
+    
+    lbl_db_watch_status = ttk.Label(tab_db, text="DB Auto-Update: OFF", foreground="gray")
+    lbl_db_watch_status.pack(pady=2)
+    
     lbl_db_status = ttk.Label(tab_db, text="")
-    lbl_db_status.pack(pady=5)
+    lbl_db_status.pack(pady=2)
     
     frame_search = ttk.LabelFrame(tab_db, text="Test AI Search")
     frame_search.pack(fill='both', expand=True, padx=10, pady=10)

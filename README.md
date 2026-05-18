@@ -6,33 +6,37 @@ When working on large codebases, AI assistants often suffer from "context loss."
 
 ## 🚀 Key Features
 
-1. **Zero-Config Repository Mapper (`AI_MAP.md`)**
-   CodeCompass rapidly scans your project and uses regex-based heuristics to extract critical elements (functions, classes, types, hooks, interfaces). It generates a concise `AI_MAP.md` file. When an AI assistant reads this map upon startup, it instantly understands your entire architecture without processing gigabytes of raw code.
+1. **Tree-Sitter AST Code Mapping (`AI_MAP.md`)**
+   CodeCompass rapidly scans your project and uses **Tree-Sitter Abstract Syntax Trees** (for Python and JS/TS) to perfectly extract critical elements (exported functions, classes, types, hooks, interfaces) without the brittle errors of Regex. It generates a concise `AI_MAP.md` file. When an AI assistant reads this map upon startup, it instantly understands your entire architecture without processing gigabytes of raw code.
 
-2. **Local Vector Search (ChromaDB)**
-   The tool chunks your codebase and generates embeddings using a lightweight, local AI model (`all-MiniLM-L6-v2`), storing them in a hidden SQLite database (`.ag_chromadb`). 
-   When your AI assistant gets stuck, it can run `--search "payment error handling"`. The vector database instantly returns the exact file paths and line numbers, acting as a massive memory extension.
+2. **Incremental RAG Updates (Local Vector DB)**
+   The tool chunks your codebase and generates embeddings using a lightweight, local AI model (`all-MiniLM-L6-v2`), storing them in a hidden SQLite database (`.ag_chromadb`).
+   **New:** CodeCompass features a live background Watcher. When you hit `Ctrl+S` (Save) on a file, it performs an **Incremental DB Update**. It deletes only the modified file's old vectors and embeds the new ones in milliseconds! No more waiting for a full 5-minute database rebuild.
 
-3. **Auto-Generated AI Instructions (`.cursorrules`)**
+3. **Standalone Universal Tool (Dynamic Directory Selection)**
+   You don't need to lock the tool inside a specific repository. You can select *any* target directory from the CodeCompass GUI, making it a truly universal context-builder for all your projects.
+
+4. **Auto-Generated AI Instructions (`.cursorrules`)**
    CodeCompass automatically generates (or appends to) your `.cursorrules` or `.clauderules` file. It teaches your AI assistant *how* to use the vector database natively, allowing it to perform semantic searches autonomously!
 
 ## 🌍 Supported Languages
 CodeCompass is universally compatible and automatically ignores heavy/irrelevant folders (`node_modules`, `.git`, `venv`, `__pycache__`, etc.).
-- **Supported:** JavaScript, TypeScript, Python, C#, Java, Kotlin, PHP, Go, Rust, C, C++, Ruby.
+- **Tree-Sitter AST Parsing:** JavaScript, TypeScript, TSX/JSX, Python.
+- **Regex Fallback Parsing:** C#, Java, Kotlin, PHP, Go, Rust, C, C++, Ruby.
 
 ---
 
 ## 📦 Installation (Drop-in Portability)
 
-CodeCompass is designed to be dropped into any project in seconds.
+CodeCompass is designed to be dropped into any project in seconds, or run as a standalone app.
 
 1. Ensure **Python 3.9+** is installed on your machine.
-2. Copy the `codecompass` folder into the root of your project.
-3. Open a terminal in the root of your project and install the dependencies:
+2. Copy the `codecompass` folder anywhere on your computer (or into your project root).
+3. Open a terminal and install the dependencies:
    ```bash
    pip install -r codecompass/requirements.txt
    ```
-   *(This installs ChromaDB for vector search and Watchdog for live file monitoring).*
+   *(This automatically installs pre-compiled wheels for ChromaDB, Tree-Sitter, and Watchdog).*
 
 ---
 
@@ -45,8 +49,9 @@ python codecompass/codecompass.py
 ```
 *(Tip: Always run it from your terminal rather than double-clicking the file in Explorer, to ensure it uses the correct Python environment where you installed the dependencies!)*
 
-- **Code Map Tab:** Generate the `AI_MAP.md` or start the background File Watcher to keep the map updated on every file save.
-- **Vector Database Tab:** Build the semantic index of your codebase (the first run may take a few minutes as it downloads the ~90MB local embedding model) and test the AI search functionality.
+- **Top Bar:** Click **"Change Directory"** to target any repository on your computer.
+- **Code Map Tab:** Generate the `AI_MAP.md` manually, or toggle the checkbox to auto-update it every time you save a file.
+- **Vector Database Tab:** Build the semantic index of your codebase (the first run may take a few minutes as it downloads the ~90MB local embedding model). Toggle the incremental Watcher to auto-update the DB in the background.
 
 ---
 
@@ -73,7 +78,7 @@ These are the commands that your AI assistant will use under the hood (defined i
 
 ### 3. The `AI_MAP.md` is generated in the wrong folder
 **What happened?** If the map generates inside the `codecompass` folder instead of the project root, it's usually because you used a "Run Python File" button in your IDE, which overrides the working directory.
-**Solution:** The latest version of CodeCompass has a foolproof path resolver, but always ensure you are running the script from the root directory of your project.
+**Solution:** The latest version of CodeCompass has a foolproof path resolver and a Directory Selection GUI, ensuring you always target the correct root.
 
 ### 4. Will this overwrite my custom `.cursorrules`?
 **No.** CodeCompass intelligently checks for an existing `.cursorrules` file. If it finds one, it safely **appends** its tool instructions to the bottom of the file without modifying your existing custom rules.
